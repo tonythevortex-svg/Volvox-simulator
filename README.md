@@ -90,7 +90,3 @@ Additional parameters throughout the code influence growth, movement, life span,
 ## Development and AI acknowledgement
 
 **The code was developed with generative AI assistance (OpenAI ChatGPT)** through an iterative process of prompting, testing, feedback and revision. The artistic concept, creative direction, selection of behaviours and research context were guided by the project author. This repository documents an evolving experimental work rather than a finished scientific model.
-
-## Licence
-
-No licence has been specified for the original project code. Add a `LICENSE` file if you wish to define terms for reuse. The p5.js libraries are third-party dependencies with their own licensing terms.
