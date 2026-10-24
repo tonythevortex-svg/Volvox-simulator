@@ -1,0 +1,828 @@
+
+/*
+ VOLVOX POND SIMULATOR
+ Sound repair + click-to-spawn
+ p5.js 1.x
+
+ Click = new Volvox + unlock sound
+ S = sound on/off
+ F = fullscreen
+ R = start/stop recording
+
+ Uses native Web Audio.
+ No p5.sound library required.
+*/
+
+const INITIAL_COLONIES = 13;
+const MAX_COLONIES = 90;
+const MAX_AUDIO_VOICES = 12;
+
+const PORTRAIT_W = 1080;
+const PORTRAIT_H = 1350;
+
+let colonies = [];
+let suspendedParticles = [];
+let pondCanvas;
+
+let soundContext = null;
+let soundMaster = null;
+let soundFilter = null;
+let recordAudioDestination = null;
+let audioVoices = [];
+let soundMuted = false;
+
+let recorder = null;
+let recordedChunks = [];
+let isRecording = false;
+let recordingExtension = 'webm';
+
+function setup() {
+  pixelDensity(1);
+
+  pondCanvas = createCanvas(
+    PORTRAIT_W,
+    PORTRAIT_H
+  );
+
+  frameRate(30);
+
+  for (let i = 0; i < INITIAL_COLONIES; i++) {
+    colonies.push(
+      new Colony(
+        random(width),
+        random(height),
+        false
+      )
+    );
+  }
+
+  for (let i = 0; i < 160; i++) {
+    suspendedParticles.push({
+      x: random(width),
+      y: random(height),
+      s: random(0.5, 2.2),
+      speed: random(0.08, 0.42),
+      a: random(8, 42)
+    });
+  }
+}
+
+function draw() {
+  background(1, 8, 9);
+  drawPond();
+
+  const countAtStart = colonies.length;
+
+  for (let i = 0; i < countAtStart; i++) {
+    colonies[i].update();
+  }
+
+  colonies = colonies.filter(c => !c.dead);
+
+  colonies.sort((a, b) => a.depth - b.depth);
+
+  for (const colony of colonies) {
+    colony.display();
+  }
+
+  updateSound();
+  drawOverlay();
+}
+
+// ---------- POND BACKGROUND ----------
+
+function drawPond() {
+  noStroke();
+
+  for (const p of suspendedParticles) {
+    p.y += p.speed;
+    p.x += sin(
+      frameCount * 0.006 + p.y * 0.008
+    ) * 0.15;
+
+    if (p.y > height + 4) {
+      p.y = -4;
+      p.x = random(width);
+    }
+
+    fill(62, 175, 121, p.a);
+    circle(p.x, p.y, p.s);
+  }
+}
+
+// ---------- CONTROLS ----------
+
+function drawOverlay() {
+  push();
+  noStroke();
+
+  textFont('monospace');
+  textSize(17);
+  textAlign(LEFT, TOP);
+
+  fill(174, 221, 194, 175);
+
+  const state = !soundContext
+    ? 'CLICK TO SPAWN + ENABLE SOUND'
+    : soundMuted
+      ? 'SOUND OFF'
+      : 'SOUND ON';
+
+  text(state, 25, 24);
+
+  fill(166, 204, 185, 118);
+  text(
+    'Click: new Volvox   S: sound   F: fullscreen   R: record',
+    25, 49
+  );
+
+  if (isRecording) {
+    fill(255, 87, 87);
+    circle(width - 35, 35, 13);
+
+    textAlign(RIGHT, TOP);
+    text('REC', width - 51, 26);
+  }
+
+  pop();
+}
+
+// ---------- CLICK TO SPAWN ----------
+
+function mousePressed() {
+  if (
+    mouseX < 0 ||
+    mouseX > width ||
+    mouseY < 0 ||
+    mouseY > height
+  ) {
+    return;
+  }
+
+  // Unlock browser audio on user interaction.
+  unlockSound();
+
+  // Spawn a new colony exactly where clicked.
+  colonies.push(
+    new Colony(mouseX, mouseY, true)
+  );
+
+  if (colonies.length > MAX_COLONIES) {
+    colonies.shift();
+  }
+
+  playBirthTone(mouseX, 0.11);
+
+  return false;
+}
+
+function keyPressed() {
+  if (key === 's' || key === 'S') {
+    soundMuted = !soundMuted;
+
+    if (!soundMuted) {
+      unlockSound();
+    }
+
+    if (soundMaster && soundContext) {
+      soundMaster.gain.setTargetAtTime(
+        soundMuted ? 0 : 0.5,
+        soundContext.currentTime,
+        0.045
+      );
+    }
+  }
+
+  else if (key === 'f' || key === 'F') {
+    fullscreen(!fullscreen());
+  }
+
+  else if (key === 'r' || key === 'R') {
+    if (isRecording) {
+      stopRecording();
+    } else {
+      startRecording();
+    }
+  }
+}
+
+// ---------- WEB AUDIO ----------
+
+function unlockSound() {
+  if (!soundContext) {
+    const AudioContextClass =
+      window.AudioContext ||
+      window.webkitAudioContext;
+
+    if (!AudioContextClass) {
+      console.warn(
+        'This browser does not support Web Audio.'
+      );
+      return;
+    }
+
+    soundContext = new AudioContextClass();
+
+    soundMaster = soundContext.createGain();
+    soundMaster.gain.value =
+      soundMuted ? 0 : 0.5;
+
+    soundFilter =
+      soundContext.createBiquadFilter();
+
+    soundFilter.type = 'lowpass';
+    soundFilter.frequency.value = 1050;
+    soundFilter.Q.value = 0.35;
+
+    soundMaster.connect(soundFilter);
+    soundFilter.connect(
+      soundContext.destination
+    );
+
+    recordAudioDestination =
+      soundContext.createMediaStreamDestination();
+
+    soundFilter.connect(
+      recordAudioDestination
+    );
+
+    // Each voice is a continuous oscillator.
+    // Its pitch and amplitude follow a colony.
+    for (let i = 0; i < MAX_AUDIO_VOICES; i++) {
+      const osc =
+        soundContext.createOscillator();
+
+      osc.type = 'sine';
+
+      const amp = soundContext.createGain();
+      amp.gain.value = 0;
+
+      osc.connect(amp);
+      amp.connect(soundMaster);
+
+      osc.frequency.value = 170 + 12 * i;
+      osc.start();
+
+      audioVoices.push({ osc, amp });
+    }
+  }
+
+  if (soundContext.state !== 'running') {
+    soundContext.resume().catch(err => {
+      console.warn(
+        'Audio could not resume:', err
+      );
+    });
+  }
+}
+
+// ---------- MOVEMENT-GENERATED SOUND ----------
+
+function updateSound() {
+  if (
+    !soundContext ||
+    soundContext.state !== 'running'
+  ) {
+    return;
+  }
+
+  const t = soundContext.currentTime;
+
+  const active = colonies.filter(
+    c => !c.dead && c.opacity > 0.15
+  );
+
+  const numVoices = min(
+    MAX_AUDIO_VOICES,
+    active.length
+  );
+
+  const perVoiceGain =
+    numVoices > 0
+      ? 0.15 / sqrt(numVoices)
+      : 0;
+
+  for (let i = 0; i < audioVoices.length; i++) {
+    const v = audioVoices[i];
+
+    if (i < numVoices) {
+      const c = active[i];
+
+      const vertical = constrain(
+        c.y / height, 0, 1
+      );
+
+      const horizontal = constrain(
+        c.x / width, 0, 1
+      );
+
+      const pitch =
+        125 +
+        (1 - vertical) * 215 +
+        horizontal * 37;
+
+      const wave =
+        sin(frameCount * 0.014 + c.phase) * 13;
+
+      const fade = c.opacity;
+
+      v.osc.frequency.setTargetAtTime(
+        pitch + wave,
+        t,
+        0.12
+      );
+
+      const amplitude =
+        perVoiceGain *
+        fade *
+        (
+          0.78 +
+          0.22 * sin(
+            frameCount * 0.013 + c.phase
+          )
+        );
+
+      v.amp.gain.setTargetAtTime(
+        amplitude,
+        t,
+        0.12
+      );
+    } else {
+      v.amp.gain.setTargetAtTime(
+        0, t, 0.1
+      );
+    }
+  }
+}
+
+// ---------- SOUND WHEN A COLONY APPEARS ----------
+
+function playBirthTone(x, strength = 0.12) {
+  if (
+    !soundContext ||
+    soundMuted ||
+    soundContext.state !== 'running'
+  ) {
+    return;
+  }
+
+  const t = soundContext.currentTime;
+
+  const osc =
+    soundContext.createOscillator();
+
+  const gain =
+    soundContext.createGain();
+
+  osc.type = 'sine';
+
+  osc.frequency.setValueAtTime(
+    330 + (x / width) * 190,
+    t
+  );
+
+  osc.frequency.exponentialRampToValueAtTime(
+    180, t + 0.4
+  );
+
+  gain.gain.setValueAtTime(
+    0.0001, t
+  );
+
+  gain.gain.exponentialRampToValueAtTime(
+    strength, t + 0.018
+  );
+
+  gain.gain.exponentialRampToValueAtTime(
+    0.0001, t + 0.75
+  );
+
+  osc.connect(gain);
+  gain.connect(soundMaster);
+
+  osc.start(t);
+  osc.stop(t + 0.8);
+
+  osc.onended = () => {
+    osc.disconnect();
+    gain.disconnect();
+  };
+}
+
+// ---------- VOLVOX COLONY ----------
+
+class Colony {
+  constructor(x, y, newborn = false) {
+    this.x = x;
+    this.y = y;
+
+    this.depth = random(0.55, 1.4);
+
+    this.maxR =
+      random(30, 67) * this.depth;
+
+    this.r = newborn
+      ? this.maxR * 0.21
+      : this.maxR;
+
+    this.growth = newborn ? 0 : 1;
+
+    this.vx =
+      random(-0.32, 0.32) * this.depth;
+
+    this.vy =
+      random(-0.30, 0.30) * this.depth;
+
+    this.phase = random(TWO_PI);
+    this.rotation = random(TWO_PI);
+
+    this.rotSpeed =
+      random(-0.002, 0.002);
+
+    this.age = newborn
+      ? 0
+      : random(0, 500);
+
+    this.lifetime =
+      random(1250, 2400);
+
+    this.opacity = 1;
+    this.ruptured = false;
+    this.dead = false;
+    this.fadingFrames = 0;
+
+    this.seeds = [];
+
+    const pointCount =
+      floor(random(135, 205));
+
+    for (let i = 0; i < pointCount; i++) {
+      const theta = random(TWO_PI);
+      const z = random(-1, 1);
+      const rr = sqrt(1 - z * z);
+
+      this.seeds.push({
+        x: rr * cos(theta),
+        y: rr * sin(theta),
+        z: z,
+        s: random(1.3, 3.3)
+      });
+    }
+
+    this.daughterPhase =
+      random(TWO_PI);
+  }
+
+  // ---------- MOVEMENT ----------
+
+  update() {
+    this.age++;
+
+    const swirl = noise(
+      this.x * 0.0022,
+      this.y * 0.0022,
+      frameCount * 0.0015
+    );
+
+    const angle = map(
+      swirl, 0, 1, -PI, PI
+    );
+
+    this.vx = lerp(
+      this.vx,
+      cos(angle) * 0.48 * this.depth,
+      0.018
+    );
+
+    this.vy = lerp(
+      this.vy,
+      sin(angle) * 0.48 * this.depth,
+      0.018
+    );
+
+    this.x += this.vx;
+    this.y += this.vy;
+
+    this.rotation += this.rotSpeed;
+
+    // Wrap around pond boundaries.
+    const margin = this.maxR + 10;
+
+    if (this.x < -margin) {
+      this.x = width + margin;
+    }
+
+    if (this.x > width + margin) {
+      this.x = -margin;
+    }
+
+    if (this.y < -margin) {
+      this.y = height + margin;
+    }
+
+    if (this.y > height + margin) {
+      this.y = -margin;
+    }
+
+    // Gradual growth of newly spawned colonies.
+    if (this.growth < 1) {
+      this.growth = min(
+        1,
+        this.growth + 0.0048
+      );
+
+      this.r = lerp(
+        this.maxR * 0.21,
+        this.maxR,
+        easeOutCubic(this.growth)
+      );
+    }
+
+    // Reproductive lifecycle.
+    if (
+      !this.ruptured &&
+      this.age > this.lifetime
+    ) {
+      this.rupture();
+    }
+
+    if (this.ruptured) {
+      this.fadingFrames++;
+
+      this.opacity = max(
+        0,
+        1 - this.fadingFrames / 135
+      );
+
+      if (this.opacity <= 0) {
+        this.dead = true;
+      }
+    }
+  }
+
+  // ---------- REPRODUCTION ----------
+
+  rupture() {
+    this.ruptured = true;
+
+    playBirthTone(this.x, 0.065);
+
+    if (colonies.length >= MAX_COLONIES - 4) {
+      return;
+    }
+
+    const n = floor(random(2, 5));
+
+    for (let i = 0; i < n; i++) {
+      const a =
+        TWO_PI * i / n +
+        random(-0.28, 0.28);
+
+      const child = new Colony(
+        this.x + cos(a) * this.r * 0.45,
+        this.y + sin(a) * this.r * 0.45,
+        true
+      );
+
+      child.vx =
+        cos(a) * random(0.35, 1.3);
+
+      child.vy =
+        sin(a) * random(0.35, 1.3);
+
+      colonies.push(child);
+    }
+  }
+
+  // ---------- DISPLAY ----------
+
+  display() {
+    push();
+
+    translate(this.x, this.y);
+
+    const shimmer =
+      0.96 +
+      0.04 * sin(
+        frameCount * 0.018 +
+        this.phase
+      );
+
+    const radius = this.r * shimmer;
+
+    rotate(this.rotation);
+
+    noFill();
+
+    stroke(
+      45, 210, 128,
+      36 * this.opacity
+    );
+
+    strokeWeight(1);
+    circle(0, 0, radius * 2);
+
+    // Developing daughter spheres.
+    if (
+      !this.ruptured &&
+      this.age > this.lifetime * 0.64
+    ) {
+      const progress = constrain(
+        map(
+          this.age,
+          this.lifetime * 0.64,
+          this.lifetime,
+          0, 1
+        ),
+        0, 1
+      );
+
+      for (let i = 0; i < 3; i++) {
+        const a =
+          TWO_PI * i / 3 +
+          this.daughterPhase;
+
+        const xx =
+          cos(a) * radius * 0.34;
+
+        const yy =
+          sin(a) * radius * 0.34;
+
+        stroke(
+          80, 235, 138,
+          95 * progress * this.opacity
+        );
+
+        circle(
+          xx, yy,
+          radius * progress * 0.33
+        );
+      }
+    }
+
+    noStroke();
+
+    // Individual algal cells arranged
+    // on a rotating spherical shell.
+    for (const point of this.seeds) {
+      const xx =
+        point.x * cos(this.rotation * 0.5) -
+        point.z * sin(this.rotation * 0.5);
+
+      const zz =
+        point.x * sin(this.rotation * 0.5) +
+        point.z * cos(this.rotation * 0.5);
+
+      const yy = point.y;
+
+      const light = map(
+        zz, -1, 1, 22, 205
+      );
+
+      fill(
+        48 + 35 * max(0, zz),
+        170 + 55 * max(0, zz),
+        95 + 35 * max(0, zz),
+        light * this.opacity
+      );
+
+      circle(
+        xx * radius,
+        yy * radius,
+        point.s * (
+          0.7 + (zz + 1) * 0.3
+        )
+      );
+    }
+
+    pop();
+  }
+}
+
+function easeOutCubic(t) {
+  return 1 - pow(1 - t, 3);
+}
+
+// ---------- RECORD VIDEO + AUDIO ----------
+
+function startRecording() {
+  if (
+    !window.MediaRecorder ||
+    !pondCanvas ||
+    !pondCanvas.elt.captureStream
+  ) {
+    console.warn(
+      'Recording is not supported in this browser.'
+    );
+    return;
+  }
+
+  unlockSound();
+
+  const stream =
+    pondCanvas.elt.captureStream(30);
+
+  if (recordAudioDestination) {
+    const track =
+      recordAudioDestination.stream
+        .getAudioTracks()[0];
+
+    if (track) {
+      stream.addTrack(track);
+    }
+  }
+
+  const supported = [
+    [
+      'video/mp4;codecs="avc1.42E01E,mp4a.40.2"',
+      'mp4'
+    ],
+    ['video/mp4', 'mp4'],
+    ['video/webm;codecs=vp9,opus', 'webm'],
+    ['video/webm;codecs=vp8,opus', 'webm'],
+    ['video/webm', 'webm']
+  ];
+
+  const selected = supported.find(
+    ([type]) => MediaRecorder.isTypeSupported(type)
+  );
+
+  const opts = selected
+    ? { mimeType: selected[0] }
+    : {};
+
+  recordingExtension = selected
+    ? selected[1]
+    : 'webm';
+
+  try {
+    recorder = new MediaRecorder(
+      stream, opts
+    );
+
+    recordedChunks = [];
+
+    recorder.ondataavailable = e => {
+      if (e.data && e.data.size > 0) {
+        recordedChunks.push(e.data);
+      }
+    };
+
+    recorder.onstop = () => {
+      const blob = new Blob(
+        recordedChunks,
+        {
+          type: recorder.mimeType ||
+                'video/webm'
+        }
+      );
+
+      const url =
+        URL.createObjectURL(blob);
+
+      const a =
+        document.createElement('a');
+
+      a.href = url;
+
+      a.download =
+        `volvox-pond-${Date.now()}.${recordingExtension}`;
+
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+
+      setTimeout(
+        () => URL.revokeObjectURL(url),
+        6000
+      );
+
+      stream.getTracks().forEach(
+        track => track.stop()
+      );
+
+      isRecording = false;
+    };
+
+    recorder.start(1000);
+    isRecording = true;
+
+  } catch (err) {
+    console.error(
+      'Recording could not start:', err
+    );
+
+    stream.getTracks().forEach(
+      track => track.stop()
+    );
+  }
+}
+
+function stopRecording() {
+  if (
+    recorder &&
+    recorder.state === 'recording'
+  ) {
+    recorder.stop();
+  }
+}
